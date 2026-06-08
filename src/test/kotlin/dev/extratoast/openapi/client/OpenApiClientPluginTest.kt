@@ -1,12 +1,19 @@
 package dev.extratoast.openapi.client
 
+import org.gradle.api.GradleException
+import org.gradle.api.plugins.JavaPluginExtension
+import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.testfixtures.ProjectBuilder
 import org.gradle.testkit.runner.BuildResult
 import org.gradle.testkit.runner.GradleRunner
 import org.gradle.testkit.runner.TaskOutcome
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.openapitools.generator.gradle.plugin.tasks.GenerateTask
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createDirectories
@@ -171,6 +178,187 @@ class OpenApiClientPluginTest {
         assertTrue(result.output.contains("openApiClient.schemaMappings must not contain blank keys or values"))
     }
 
+    @Test
+    fun `applies plugin conventions to a Gradle project`() {
+        writeBuildFile("")
+        writeResource("specs/sample.yml", tempDir.resolve("specs/sample.yml"))
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+
+        OpenApiClientPlugin().apply(project)
+
+        val extension = project.extensions.getByType(OpenApiClientExtension::class.java)
+        extension.specPath.set("specs/sample.yml")
+        extension.apiPackage.set("com.example.pet.api")
+        extension.modelPackage.set("com.example.pet.model")
+        extension.packageName.set("com.example.pet.invoker")
+        extension.apis.set(listOf("Pets"))
+        extension.schemaMappings.set(mapOf("UnusedInlineSchema" to "java.lang.Object"))
+        extension.typeMappings.set(mapOf("unused-format" to "java.lang.String"))
+
+        val generate = project.tasks.named("generate", GenerateTask::class.java).get()
+        assertEquals("openapi", generate.group)
+        assertFalse(generate.validateSpec.get())
+        assertEquals("java", generate.generatorName.get())
+        assertEquals("restclient", generate.library.get())
+        assertEquals(tempDir.resolve("specs/sample.yml").toFile(), generate.inputSpec.get().asFile)
+        assertEquals(tempDir.resolve("build/generated/openapi").toFile(), generate.outputDir.get().asFile)
+        assertEquals("com.example.pet.api", generate.apiPackage.get())
+        assertEquals("com.example.pet.model", generate.modelPackage.get())
+        assertEquals("com.example.pet.invoker", generate.packageName.get())
+        assertEquals(
+            mapOf("apis" to "Pets", "models" to "", "supportingFiles" to ""),
+            generate.globalProperties.get(),
+        )
+        assertEquals(mapOf("UnusedInlineSchema" to "java.lang.Object"), generate.schemaMappings.get())
+        assertEquals(mapOf("unused-format" to "java.lang.String"), generate.typeMappings.get())
+        assertEquals(
+            mapOf(
+                "sourceFolder" to "src/main/java",
+                "serializationLibrary" to "jackson",
+                "dateLibrary" to "java8",
+                "useJakartaEe" to "true",
+                "useBeanValidation" to "true",
+                "useJackson3" to "true",
+                "useSpringBoot4" to "true",
+                "enumPropertyNaming" to "MACRO_CASE",
+            ),
+            generate.configOptions.get(),
+        )
+
+        val alias = project.tasks.named("generateOpenApiClient").get()
+        assertTrue(alias.taskDependencies.getDependencies(alias).contains(generate))
+
+        val compileJava = project.tasks.named("compileJava", JavaCompile::class.java).get()
+        assertTrue(compileJava.taskDependencies.getDependencies(compileJava).contains(generate))
+
+        val java = project.extensions.getByType(JavaPluginExtension::class.java)
+        assertTrue(
+            java.sourceSets.getByName("main").java.srcDirs.any {
+                it.toPath().endsWith("build/generated/openapi/src/main/java")
+            },
+        )
+
+        val implementation = project.configurations.getByName("implementation").dependencies
+        assertTrue(implementation.any { it.group == "org.springframework" && it.name == "spring-web" })
+        assertTrue(implementation.any { it.group == "tools.jackson" && it.name == "jackson-bom" })
+    }
+
+    @Test
+    fun `uses build file as inert generate input until a spec is configured`() {
+        writeBuildFile("")
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+
+        OpenApiClientPlugin().apply(project)
+
+        val generate = project.tasks.named("generate", GenerateTask::class.java).get()
+        assertEquals(project.buildFile, generate.inputSpec.get().asFile)
+        assertTrue(generate.inputs.files.files.contains(project.buildFile))
+    }
+
+    @Test
+    fun `validates yaml and json specs directly`() {
+        val yaml = writeSpec(
+            "specs/direct.yml",
+            """
+            openapi: 3.0.3
+            info:
+              title: Direct API
+              version: 1.0.0
+            paths:
+              /pets:
+                get:
+                  tags:
+                    - Pets
+                  responses:
+                    '204':
+                      description: No content.
+              /metadata:
+                parameters: []
+            """.trimIndent(),
+        )
+        validateConfiguration(
+            specFile = yaml,
+            apis = listOf("Pets"),
+            schemaMappings = mapOf("PetEnvelope" to "com.example.PetEnvelope"),
+            typeMappings = mapOf("uuid" to "java.util.UUID"),
+        )
+
+        val json = writeSpec(
+            "specs/direct.json",
+            """
+            {
+              "openapi": "3.0.3",
+              "info": {"title": "Direct JSON API", "version": "1.0.0"},
+              "paths": {}
+            }
+            """.trimIndent(),
+        )
+        validateConfiguration(specFile = json, apis = emptyList())
+    }
+
+    @Test
+    fun `rejects invalid direct configuration`() {
+        writeResource("specs/sample.yml", tempDir.resolve("specs/sample.yml"))
+        val validSpec = tempDir.resolve("specs/sample.yml")
+
+        assertValidationFails(
+            "openApiClient.apiPackage is required",
+            specFile = validSpec,
+            apiPackage = "",
+        )
+        assertValidationFails(
+            "openApiClient.apis must not contain blank values",
+            specFile = validSpec,
+            apis = listOf(" "),
+        )
+        assertValidationFails(
+            "openApiClient.typeMappings must not contain blank keys or values",
+            specFile = validSpec,
+            typeMappings = mapOf("uuid" to ""),
+        )
+        assertValidationFails(
+            "openApiClient.specPath is required",
+            specPath = "specs/missing.yml",
+            specFile = null,
+        )
+        assertValidationFails(
+            "OpenAPI spec file does not exist",
+            specFile = tempDir.resolve("specs/missing.yml"),
+        )
+        assertValidationFails(
+            "OpenAPI spec file is not readable",
+            specFile = tempDir,
+        )
+
+        val emptySpec = writeSpec("specs/empty.yml", "")
+        assertValidationFails("OpenAPI spec file is empty", specFile = emptySpec)
+
+        val invalidJson = writeSpec("specs/broken.json", "{")
+        assertValidationFails("OpenAPI spec must be valid JSON or YAML", specFile = invalidJson)
+
+        val missingPaths = writeSpec(
+            "specs/missing-paths.yml",
+            """
+            openapi: 3.0.3
+            info:
+              title: Missing paths
+              version: 1.0.0
+            """.trimIndent(),
+        )
+        assertValidationFails("OpenAPI spec must contain a 'paths' object", specFile = missingPaths)
+
+        writeResource("specs/untagged.yml", tempDir.resolve("specs/untagged.yml"))
+        assertValidationFails(
+            "Available tags: (none)",
+            specFile = tempDir.resolve("specs/untagged.yml"),
+            apis = listOf("Missing"),
+        )
+    }
+
     private fun writeSettings() {
         tempDir.resolve("settings.gradle.kts").writeText("rootProject.name = \"consumer\"")
     }
@@ -218,6 +406,64 @@ class OpenApiClientPluginTest {
             apis.set(listOf(${apis.joinToString { it.toKotlinString() }}))
         }
         """.trimIndent()
+
+    private fun writeSpec(relativePath: String, contents: String): Path {
+        val target = tempDir.resolve(relativePath)
+        target.parent.createDirectories()
+        target.writeText(contents)
+        return target
+    }
+
+    private fun validateConfiguration(
+        specFile: Path?,
+        specPath: String? = specFile?.toString() ?: "spec.yml",
+        apiPackage: String? = "com.example.pet.api",
+        modelPackage: String? = "com.example.pet.model",
+        packageName: String? = "com.example.pet.invoker",
+        apis: List<String> = listOf("Pets"),
+        schemaMappings: Map<String, String> = emptyMap(),
+        typeMappings: Map<String, String> = emptyMap(),
+    ) {
+        OpenApiClientConfigurationValidator.validate(
+            specPath = specPath,
+            specFile = specFile?.toFile(),
+            apiPackage = apiPackage,
+            modelPackage = modelPackage,
+            packageName = packageName,
+            apis = apis,
+            schemaMappings = schemaMappings,
+            typeMappings = typeMappings,
+        )
+    }
+
+    private fun assertValidationFails(
+        expectedMessage: String,
+        specFile: Path?,
+        specPath: String? = specFile?.toString() ?: "spec.yml",
+        apiPackage: String? = "com.example.pet.api",
+        modelPackage: String? = "com.example.pet.model",
+        packageName: String? = "com.example.pet.invoker",
+        apis: List<String> = listOf("Pets"),
+        schemaMappings: Map<String, String> = emptyMap(),
+        typeMappings: Map<String, String> = emptyMap(),
+    ) {
+        val error = assertThrows(GradleException::class.java) {
+            validateConfiguration(
+                specPath = specPath,
+                specFile = specFile,
+                apiPackage = apiPackage,
+                modelPackage = modelPackage,
+                packageName = packageName,
+                apis = apis,
+                schemaMappings = schemaMappings,
+                typeMappings = typeMappings,
+            )
+        }
+        assertTrue(
+            error.message?.contains(expectedMessage) == true,
+            "Expected '${error.message}' to contain '$expectedMessage'",
+        )
+    }
 
     private fun preparedSpecText(): String =
         """
