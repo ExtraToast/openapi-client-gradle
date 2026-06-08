@@ -1,5 +1,6 @@
 package dev.extratoast.openapi.client
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.gradle.api.GradleException
 import org.gradle.api.plugins.JavaPluginExtension
 import org.gradle.api.tasks.compile.JavaCompile
@@ -17,9 +18,12 @@ import org.openapitools.generator.gradle.plugin.tasks.GenerateTask
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createDirectories
+import kotlin.io.path.readText
 import kotlin.io.path.writeText
 
 class OpenApiClientPluginTest {
+    private val jsonMapper = ObjectMapper()
+
     @TempDir
     lateinit var tempDir: Path
 
@@ -179,6 +183,191 @@ class OpenApiClientPluginTest {
     }
 
     @Test
+    fun `downloads and normalizes configured external specs with deterministic json output`() {
+        writeSettings()
+        writeSpec(
+            "fixtures/upstream.json",
+            """
+            {
+              "paths": {},
+              "openapi": "3.0.3",
+              "info": {
+                "version": "1.0.0",
+                "title": "JSON Fixture"
+              }
+            }
+            """.trimIndent(),
+        )
+        writeSpec(
+            "fixtures/upstream.yml",
+            """
+            paths: {}
+            openapi: 3.0.3
+            info:
+              version: 1.0.0
+              title: YAML Fixture
+            """.trimIndent(),
+        )
+        writeBuildFile(
+            """
+            plugins {
+                id("dev.extratoast.openapi-client")
+            }
+
+            openApiExternalSpecs {
+                specDirectory.set(layout.buildDirectory.dir("central-openapi-specs"))
+                specs {
+                    create("jsonFixture") {
+                        sourceUrl.set(file("fixtures/upstream.json").toURI().toString())
+                        rawFileName.set("json-fixture.raw")
+                        normalizedFileName.set("json-fixture.json")
+                    }
+                    create("yamlFixture") {
+                        sourceUrl.set(file("fixtures/upstream.yml").toURI().toString())
+                        rawFileName.set("yaml-fixture.yml")
+                        normalizedFileName.set("yaml-fixture.json")
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val result = runGradle("downloadExternalOpenApiSpecs", "normalizeExternalOpenApiSpecs")
+
+        assertEquals(TaskOutcome.SUCCESS, result.task(":downloadExternalOpenApiSpecs")?.outcome)
+        assertEquals(TaskOutcome.SUCCESS, result.task(":normalizeExternalOpenApiSpecs")?.outcome)
+        assertTrue(Files.exists(tempDir.resolve("build/central-openapi-specs/json-fixture.raw")))
+        assertEquals(
+            """{"info":{"title":"JSON Fixture","version":"1.0.0"},"openapi":"3.0.3","paths":{}}""",
+            tempDir.resolve("build/central-openapi-specs/json-fixture.json").readText(),
+        )
+        assertEquals(
+            """{"info":{"title":"YAML Fixture","version":"1.0.0"},"openapi":"3.0.3","paths":{}}""",
+            tempDir.resolve("build/central-openapi-specs/yaml-fixture.json").readText(),
+        )
+    }
+
+    @Test
+    fun `fails clearly for misconfigured external specs`() {
+        writeSettings()
+        writeBuildFile(
+            """
+            plugins {
+                id("dev.extratoast.openapi-client")
+            }
+
+            openApiExternalSpecs {
+                specs {
+                    create("missingUrl")
+                }
+            }
+            """.trimIndent(),
+        )
+
+        var result = runGradleAndFail("downloadExternalOpenApiSpecs")
+
+        assertTrue(result.output.contains("openApiExternalSpecs.specs.missingUrl.sourceUrl is required"))
+
+        writeSpec("fixtures/broken.yml", "openapi: [")
+        writeBuildFile(
+            """
+            plugins {
+                id("dev.extratoast.openapi-client")
+            }
+
+            openApiExternalSpecs {
+                specs {
+                    create("broken") {
+                        sourceUrl.set(file("fixtures/broken.yml").toURI().toString())
+                        rawFileName.set("broken.yml")
+                        normalizedFileName.set("broken.json")
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        result = runGradleAndFail("normalizeExternalOpenApiSpecs")
+
+        assertTrue(result.output.contains("OpenAPI spec must be valid JSON or YAML"))
+
+        writeSpec("fixtures/valid.json", """{"openapi":"3.0.3","info":{"title":"Valid","version":"1.0"},"paths":{}}""")
+        writeBuildFile(
+            """
+            plugins {
+                id("dev.extratoast.openapi-client")
+            }
+
+            openApiExternalSpecs {
+                specs {
+                    create("badOutput") {
+                        sourceUrl.set(file("fixtures/valid.json").toURI().toString())
+                        rawFileName.set("valid.json")
+                        normalizedFileName.set("valid.txt")
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        result = runGradleAndFail("normalizeExternalOpenApiSpecs")
+
+        assertTrue(result.output.contains("openApiExternalSpecs.specs.badOutput.normalizedFileName must end with .json"))
+    }
+
+    @Test
+    fun `filters allowed operations injects tags and rewrites reachable schemas`() {
+        writeSpec("specs/discord-like.json", discordLikeFixture())
+        val output = tempDir.resolve("build/filtered/discord-like.json")
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+
+        val task = project.tasks.register("filterDiscordLikeSpec", OpenApiFilterSpecTask::class.java) {
+            inputSpec.set(project.layout.projectDirectory.file("specs/discord-like.json"))
+            outputSpec.set(project.layout.buildDirectory.file("filtered/discord-like.json"))
+            allowedOperations.set(
+                mapOf(
+                    "/users/@me" to listOf("get"),
+                    "/guilds/{guild_id}" to listOf("get"),
+                    "/guilds/{guild_id}/members/{user_id}" to listOf("get", "patch"),
+                ),
+            )
+            injectedTag.set("Fixture")
+        }.get()
+
+        task.filter()
+
+        val root = jsonMapper.readTree(output.toFile())
+        val paths = root.path("paths")
+        assertTrue(paths.has("/users/@me"))
+        assertTrue(paths.has("/guilds/{guild_id}"))
+        assertTrue(paths.has("/guilds/{guild_id}/members/{user_id}"))
+        assertFalse(paths.has("/unused"))
+        assertEquals("Fixture", paths.path("/users/@me").path("get").path("tags")[0].asText())
+        assertFalse(paths.path("/guilds/{guild_id}/members/{user_id}").has("delete"))
+
+        val schemas = root.path("components").path("schemas")
+        assertTrue(schemas.has("CurrentUserResponse"))
+        assertTrue(schemas.has("GuildResponse"))
+        assertTrue(schemas.has("GuildMemberResponse"))
+        assertTrue(schemas.has("SnowflakeType"))
+        assertTrue(schemas.has("NullableRoleMarker"))
+        assertTrue(schemas.has("Sticker"))
+        assertTrue(schemas.has("StickerType"))
+        assertTrue(schemas.has("ErrorResponse"))
+        assertFalse(schemas.has("UnusedSchema"))
+        assertFalse(schemas.has("UnusedComponentSchema"))
+        assertEquals("boolean", schemas.path("NullableRoleMarker").path("type").asText())
+        assertEquals(
+            "#/components/schemas/StickerType",
+            schemas.path("Sticker").path("properties").path("type").path("\$ref").asText(),
+        )
+        assertFalse(schemas.path("Sticker").path("properties").path("type").has("allOf"))
+        assertFalse(schemas.path("Sticker").path("properties").path("type").has("enum"))
+    }
+
+    @Test
     fun `applies plugin conventions to a Gradle project`() {
         writeBuildFile("")
         writeResource("specs/sample.yml", tempDir.resolve("specs/sample.yml"))
@@ -229,6 +418,12 @@ class OpenApiClientPluginTest {
 
         val alias = project.tasks.named("generateOpenApiClient").get()
         assertTrue(alias.taskDependencies.getDependencies(alias).contains(generate))
+        assertEquals(
+            tempDir.resolve("openapi-specs").toFile(),
+            project.extensions.getByType(OpenApiExternalSpecsExtension::class.java).specDirectory.get().asFile,
+        )
+        assertTrue(project.tasks.names.contains("downloadExternalOpenApiSpecs"))
+        assertTrue(project.tasks.names.contains("normalizeExternalOpenApiSpecs"))
 
         val compileJava = project.tasks.named("compileJava", JavaCompile::class.java).get()
         assertTrue(compileJava.taskDependencies.getDependencies(compileJava).contains(generate))
@@ -480,6 +675,159 @@ class OpenApiClientPluginTest {
               responses:
                 '204':
                   description: No content.
+        """.trimIndent()
+
+    private fun discordLikeFixture(): String =
+        """
+        {
+          "openapi": "3.1.0",
+          "info": {"title": "Discord-like Fixture", "version": "1.0.0"},
+          "paths": {
+            "/users/@me": {
+              "get": {
+                "operationId": "getCurrentUser",
+                "responses": {
+                  "200": {
+                    "description": "ok",
+                    "content": {
+                      "application/json": {
+                        "schema": {"${'$'}ref": "#/components/schemas/CurrentUserResponse"}
+                      }
+                    }
+                  },
+                  "4XX": {"${'$'}ref": "#/components/responses/ClientErrorResponse"}
+                }
+              }
+            },
+            "/guilds/{guild_id}": {
+              "parameters": [{"${'$'}ref": "#/components/parameters/GuildId"}],
+              "get": {
+                "operationId": "getGuild",
+                "responses": {
+                  "200": {"${'$'}ref": "#/components/responses/GuildResponse"}
+                }
+              }
+            },
+            "/guilds/{guild_id}/members/{user_id}": {
+              "get": {
+                "operationId": "getGuildMember",
+                "responses": {
+                  "200": {
+                    "description": "ok",
+                    "content": {
+                      "application/json": {
+                        "schema": {"${'$'}ref": "#/components/schemas/GuildMemberResponse"}
+                      }
+                    }
+                  }
+                }
+              },
+              "patch": {
+                "operationId": "updateGuildMember",
+                "requestBody": {
+                  "content": {
+                    "application/json": {
+                      "schema": {"${'$'}ref": "#/components/schemas/GuildMemberResponse"}
+                    }
+                  }
+                },
+                "responses": {"204": {"description": "updated"}}
+              },
+              "delete": {
+                "operationId": "deleteGuildMember",
+                "responses": {"204": {"description": "deleted"}}
+              }
+            },
+            "/unused": {
+              "get": {
+                "operationId": "unused",
+                "responses": {
+                  "200": {
+                    "description": "unused",
+                    "content": {
+                      "application/json": {
+                        "schema": {"${'$'}ref": "#/components/schemas/UnusedSchema"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "components": {
+            "parameters": {
+              "GuildId": {
+                "name": "guild_id",
+                "in": "path",
+                "required": true,
+                "schema": {"${'$'}ref": "#/components/schemas/SnowflakeType"}
+              }
+            },
+            "responses": {
+              "GuildResponse": {
+                "description": "ok",
+                "content": {
+                  "application/json": {
+                    "schema": {"${'$'}ref": "#/components/schemas/GuildResponse"}
+                  }
+                }
+              },
+              "ClientErrorResponse": {
+                "description": "error",
+                "content": {
+                  "application/json": {
+                    "schema": {"${'$'}ref": "#/components/schemas/ErrorResponse"}
+                  }
+                }
+              },
+              "UnusedResponse": {
+                "description": "unused",
+                "content": {
+                  "application/json": {
+                    "schema": {"${'$'}ref": "#/components/schemas/UnusedComponentSchema"}
+                  }
+                }
+              }
+            },
+            "schemas": {
+              "CurrentUserResponse": {
+                "type": "object",
+                "properties": {
+                  "id": {"${'$'}ref": "#/components/schemas/SnowflakeType"},
+                  "role_marker": {"${'$'}ref": "#/components/schemas/NullableRoleMarker"}
+                }
+              },
+              "GuildResponse": {
+                "type": "object",
+                "properties": {
+                  "id": {"${'$'}ref": "#/components/schemas/SnowflakeType"},
+                  "sticker": {"${'$'}ref": "#/components/schemas/Sticker"}
+                }
+              },
+              "GuildMemberResponse": {
+                "type": "object",
+                "properties": {
+                  "user": {"${'$'}ref": "#/components/schemas/CurrentUserResponse"}
+                }
+              },
+              "SnowflakeType": {"type": "string"},
+              "NullableRoleMarker": {"type": "null"},
+              "Sticker": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "allOf": [{"${'$'}ref": "#/components/schemas/StickerType"}],
+                    "enum": [1, 2]
+                  }
+                }
+              },
+              "StickerType": {"type": "integer", "enum": [1, 2, 3]},
+              "ErrorResponse": {"type": "object", "properties": {"message": {"type": "string"}}},
+              "UnusedSchema": {"type": "object"},
+              "UnusedComponentSchema": {"type": "object"}
+            }
+          }
+        }
         """.trimIndent()
 
     private fun String.toKotlinString(): String =

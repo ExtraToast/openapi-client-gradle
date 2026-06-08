@@ -19,3 +19,6 @@ target/
 
 # Logs
 *.log
+
+# Kotlin compiler build sessions
+.kotlin/
