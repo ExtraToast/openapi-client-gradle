@@ -1,0 +1,11 @@
+openapi: 3.0.3
+info:
+  title: Untagged API
+  version: 1.0.0
+paths:
+  /status:
+    get:
+      operationId: getStatus
+      responses:
+        '204':
+          description: No content.
