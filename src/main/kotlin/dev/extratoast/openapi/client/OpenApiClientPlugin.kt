@@ -291,33 +291,33 @@ class OpenApiClientPlugin : Plugin<Project> {
     }
 
     private fun Project.addGeneratedClientDependencies(extension: OpenApiClientExtension) {
-        dependencies.add(
+        dependencies.addProvider(
             "implementation",
             extension.springVersion.map { "org.springframework:spring-web:$it" },
         )
-        dependencies.add(
+        dependencies.addProvider(
             "implementation",
             extension.springVersion.map { "org.springframework:spring-context:$it" },
         )
-        dependencies.add(
+        dependencies.addProvider(
             "implementation",
-            dependencies.platform(extension.jacksonBomVersion.map { "tools.jackson:jackson-bom:$it" }),
+            extension.jacksonBomVersion.map { dependencies.platform("tools.jackson:jackson-bom:$it") },
         )
-        dependencies.add(
+        dependencies.addProvider(
             "implementation",
             extension.jacksonAnnotationsVersion.map { "com.fasterxml.jackson.core:jackson-annotations:$it" },
         )
         dependencies.add("implementation", "tools.jackson.core:jackson-core")
         dependencies.add("implementation", "tools.jackson.core:jackson-databind")
-        dependencies.add(
+        dependencies.addProvider(
             "implementation",
             extension.jacksonDatabindNullableVersion.map { "org.openapitools:jackson-databind-nullable:$it" },
         )
-        dependencies.add(
+        dependencies.addProvider(
             "compileOnly",
             extension.jakartaValidationVersion.map { "jakarta.validation:jakarta.validation-api:$it" },
         )
-        dependencies.add(
+        dependencies.addProvider(
             "compileOnly",
             extension.jakartaAnnotationVersion.map { "jakarta.annotation:jakarta.annotation-api:$it" },
         )
