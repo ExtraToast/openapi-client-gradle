@@ -26,11 +26,39 @@ abstract class OpenApiClientExtension @Inject constructor(objects: ObjectFactory
     val apiPackage: Property<String> = objects.property(String::class.java)
     val modelPackage: Property<String> = objects.property(String::class.java)
     val packageName: Property<String> = objects.property(String::class.java)
+    val javaLanguageVersion: Property<Int> = objects.property(Int::class.javaObjectType)
+    val generatorName: Property<String> = objects.property(String::class.java).convention("java")
+    val library: Property<String> = objects.property(String::class.java).convention("restclient")
+    val sourceFolder: Property<String> = objects.property(String::class.java).convention("src/main/java")
+    val serializationLibrary: Property<String> = objects.property(String::class.java).convention("jackson")
+    val dateLibrary: Property<String> = objects.property(String::class.java).convention("java8")
+    val useJakartaEe: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val useBeanValidation: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val useJackson3: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val useSpringBoot4: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val enumPropertyNaming: Property<String> = objects.property(String::class.java).convention("MACRO_CASE")
+    val generateModelTests: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(false)
+    val generateApiTests: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(false)
+    val generateApiDocumentation: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val generateModelDocumentation: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
     val apis: ListProperty<String> = objects.listProperty(String::class.java).convention(emptyList())
+    val models: ListProperty<String> = objects.listProperty(String::class.java).convention(emptyList())
+    val supportingFiles: ListProperty<String> = objects.listProperty(String::class.java).convention(emptyList())
     val schemaMappings: MapProperty<String, String> =
         objects.mapProperty(String::class.java, String::class.java).convention(emptyMap())
     val typeMappings: MapProperty<String, String> =
         objects.mapProperty(String::class.java, String::class.java).convention(emptyMap())
+    val inlineSchemaOptions: MapProperty<String, String> =
+        objects.mapProperty(String::class.java, String::class.java).convention(mapOf("RESOLVE_INLINE_ENUMS" to "true"))
+    val configOptions: MapProperty<String, String> =
+        objects.mapProperty(String::class.java, String::class.java).convention(emptyMap())
+    val springVersion: Property<String> = objects.property(String::class.java).convention("7.0.5")
+    val jacksonBomVersion: Property<String> = objects.property(String::class.java).convention("3.1.0")
+    val jacksonAnnotationsVersion: Property<String> = objects.property(String::class.java).convention("2.21")
+    val jacksonDatabindNullableVersion: Property<String> =
+        objects.property(String::class.java).convention("0.2.10")
+    val jakartaValidationVersion: Property<String> = objects.property(String::class.java).convention("3.1.1")
+    val jakartaAnnotationVersion: Property<String> = objects.property(String::class.java).convention("3.0.0")
 }
 
 class OpenApiClientPlugin : Plugin<Project> {
@@ -49,10 +77,12 @@ class OpenApiClientPlugin : Plugin<Project> {
         externalSpecs.specDirectory.convention(project.layout.projectDirectory.dir("openapi-specs"))
 
         project.repositories.mavenCentral()
-        project.addGeneratedClientDependencies()
+        project.addGeneratedClientDependencies(extension)
 
         val generatedRoot = project.layout.buildDirectory.dir("generated/openapi")
-        val generatedJavaSrc = generatedRoot.map { it.dir("src/main/java") }
+        val generatedJavaSrc = project.providers.provider {
+            generatedRoot.get().dir(extension.sourceFolder.get())
+        }
         val taskInputSpecFile = project.providers.provider {
             val configuredSpec = extension.specPath.orNull
                 ?.takeIf { it.isNotBlank() }
@@ -71,43 +101,47 @@ class OpenApiClientPlugin : Plugin<Project> {
             description = "Generates the Java client from the configured OpenAPI spec."
 
             validateSpec.set(false)
-            generatorName.set("java")
-            library.set("restclient")
+            generatorName.set(extension.generatorName)
+            library.set(extension.library)
             inputSpec.set(inputSpecFile)
             outputDir.set(generatedRoot)
 
             configOptions.set(
-                mapOf(
-                    "sourceFolder" to "src/main/java",
-                    "serializationLibrary" to "jackson",
-                    "dateLibrary" to "java8",
-                    "useJakartaEe" to "true",
-                    "useBeanValidation" to "true",
-                    "useJackson3" to "true",
-                    "useSpringBoot4" to "true",
-                    "enumPropertyNaming" to "MACRO_CASE",
-                ),
+                project.providers.provider {
+                    linkedMapOf(
+                        "sourceFolder" to extension.sourceFolder.get(),
+                        "serializationLibrary" to extension.serializationLibrary.get(),
+                        "dateLibrary" to extension.dateLibrary.get(),
+                        "useJakartaEe" to extension.useJakartaEe.get().toString(),
+                        "useBeanValidation" to extension.useBeanValidation.get().toString(),
+                        "useJackson3" to extension.useJackson3.get().toString(),
+                        "useSpringBoot4" to extension.useSpringBoot4.get().toString(),
+                        "enumPropertyNaming" to extension.enumPropertyNaming.get(),
+                    ).apply {
+                        putAll(extension.configOptions.get())
+                    }
+                },
             )
 
             apiPackage.set(extension.apiPackage.orElse(""))
             modelPackage.set(extension.modelPackage.orElse(""))
             packageName.set(extension.packageName.orElse(""))
 
-            generateModelTests.set(false)
-            generateApiTests.set(false)
-            generateApiDocumentation.set(true)
-            generateModelDocumentation.set(true)
+            generateModelTests.set(extension.generateModelTests)
+            generateApiTests.set(extension.generateApiTests)
+            generateApiDocumentation.set(extension.generateApiDocumentation)
+            generateModelDocumentation.set(extension.generateModelDocumentation)
 
-            inlineSchemaOptions.set(mapOf("RESOLVE_INLINE_ENUMS" to "true"))
+            inlineSchemaOptions.set(extension.inlineSchemaOptions)
             schemaMappings.set(extension.schemaMappings)
             typeMappings.set(extension.typeMappings)
 
             globalProperties.set(
-                extension.apis.map { apiList ->
+                project.providers.provider {
                     mapOf(
-                        "apis" to apiList.joinToString(","),
-                        "models" to "",
-                        "supportingFiles" to "",
+                        "apis" to extension.apis.get().joinToString(","),
+                        "models" to extension.models.get().joinToString(","),
+                        "supportingFiles" to extension.supportingFiles.get().joinToString(","),
                     )
                 },
             )
@@ -128,9 +162,27 @@ class OpenApiClientPlugin : Plugin<Project> {
             inputs.property("apiPackage", extension.apiPackage.orElse(""))
             inputs.property("modelPackage", extension.modelPackage.orElse(""))
             inputs.property("packageName", extension.packageName.orElse(""))
+            inputs.property("generatorName", extension.generatorName)
+            inputs.property("library", extension.library)
+            inputs.property("sourceFolder", extension.sourceFolder)
+            inputs.property("serializationLibrary", extension.serializationLibrary)
+            inputs.property("dateLibrary", extension.dateLibrary)
+            inputs.property("useJakartaEe", extension.useJakartaEe)
+            inputs.property("useBeanValidation", extension.useBeanValidation)
+            inputs.property("useJackson3", extension.useJackson3)
+            inputs.property("useSpringBoot4", extension.useSpringBoot4)
+            inputs.property("enumPropertyNaming", extension.enumPropertyNaming)
+            inputs.property("generateModelTests", extension.generateModelTests)
+            inputs.property("generateApiTests", extension.generateApiTests)
+            inputs.property("generateApiDocumentation", extension.generateApiDocumentation)
+            inputs.property("generateModelDocumentation", extension.generateModelDocumentation)
             inputs.property("apis", extension.apis)
+            inputs.property("models", extension.models)
+            inputs.property("supportingFiles", extension.supportingFiles)
             inputs.property("schemaMappings", extension.schemaMappings)
             inputs.property("typeMappings", extension.typeMappings)
+            inputs.property("inlineSchemaOptions", extension.inlineSchemaOptions)
+            inputs.property("configOptions", extension.configOptions)
             outputs.dir(generatedRoot)
             outputs.cacheIf { true }
 
@@ -143,9 +195,19 @@ class OpenApiClientPlugin : Plugin<Project> {
                     apiPackage = extension.apiPackage.orNull,
                     modelPackage = extension.modelPackage.orNull,
                     packageName = extension.packageName.orNull,
+                    generatorName = extension.generatorName.orNull,
+                    library = extension.library.orNull,
+                    sourceFolder = extension.sourceFolder.orNull,
+                    serializationLibrary = extension.serializationLibrary.orNull,
+                    dateLibrary = extension.dateLibrary.orNull,
+                    enumPropertyNaming = extension.enumPropertyNaming.orNull,
                     apis = extension.apis.getOrElse(emptyList()),
+                    models = extension.models.getOrElse(emptyList()),
+                    supportingFiles = extension.supportingFiles.getOrElse(emptyList()),
                     schemaMappings = extension.schemaMappings.getOrElse(emptyMap()),
                     typeMappings = extension.typeMappings.getOrElse(emptyMap()),
+                    inlineSchemaOptions = extension.inlineSchemaOptions.getOrElse(emptyMap()),
+                    configOptions = extension.configOptions.getOrElse(emptyMap()),
                 )
             }
         })
@@ -179,8 +241,48 @@ class OpenApiClientPlugin : Plugin<Project> {
             },
         )
 
+        externalSpecs.filters.all {
+            val filterSpec = this
+            project.tasks.register(
+                filterOpenApiSpecTaskName(filterSpec.name),
+                OpenApiFilterSpecTask::class.java,
+                Action<OpenApiFilterSpecTask> {
+                    group = "openapi"
+                    description = "Filters the '${filterSpec.name}' OpenAPI spec."
+                    inputSpec.set(
+                        project.layout.file(
+                            project.providers.provider {
+                                resolveSpecFile(project.rootProject.projectDir, filterSpec.inputSpec.get())
+                            },
+                        ),
+                    )
+                    outputSpec.set(
+                        project.layout.file(
+                            project.providers.provider {
+                                resolveSpecFile(project.rootProject.projectDir, filterSpec.outputSpec.get())
+                            },
+                        ),
+                    )
+                    allowedOperations.set(filterSpec.allowedOperations)
+                    injectedTag.set(filterSpec.injectedTag)
+                    pruneUnreachableSchemas.set(filterSpec.pruneUnreachableSchemas)
+                    rewriteNullTypes.set(filterSpec.rewriteNullTypes)
+                    collapseRedundantEnumAllOf.set(filterSpec.collapseRedundantEnumAllOf)
+                },
+            )
+        }
+
         project.extensions.configure(JavaPluginExtension::class.java, Action<JavaPluginExtension> {
             sourceSets.getByName(SourceSet.MAIN_SOURCE_SET_NAME).java.srcDir(generatedJavaSrc)
+        })
+
+        project.afterEvaluate(Action<Project> {
+            val configuredJava = extension.javaLanguageVersion.orNull
+            if (configuredJava != null) {
+                project.extensions.configure(JavaPluginExtension::class.java, Action<JavaPluginExtension> {
+                    toolchain.languageVersion.set(org.gradle.jvm.toolchain.JavaLanguageVersion.of(configuredJava))
+                })
+            }
         })
 
         project.tasks.withType(JavaCompile::class.java).configureEach(Action<JavaCompile> {
@@ -188,16 +290,37 @@ class OpenApiClientPlugin : Plugin<Project> {
         })
     }
 
-    private fun Project.addGeneratedClientDependencies() {
-        dependencies.add("implementation", "org.springframework:spring-web:7.0.5")
-        dependencies.add("implementation", "org.springframework:spring-context:7.0.5")
-        dependencies.add("implementation", dependencies.platform("tools.jackson:jackson-bom:3.1.0"))
-        dependencies.add("implementation", "com.fasterxml.jackson.core:jackson-annotations:2.21")
+    private fun Project.addGeneratedClientDependencies(extension: OpenApiClientExtension) {
+        dependencies.addProvider(
+            "implementation",
+            extension.springVersion.map { "org.springframework:spring-web:$it" },
+        )
+        dependencies.addProvider(
+            "implementation",
+            extension.springVersion.map { "org.springframework:spring-context:$it" },
+        )
+        dependencies.addProvider(
+            "implementation",
+            extension.jacksonBomVersion.map { dependencies.platform("tools.jackson:jackson-bom:$it") },
+        )
+        dependencies.addProvider(
+            "implementation",
+            extension.jacksonAnnotationsVersion.map { "com.fasterxml.jackson.core:jackson-annotations:$it" },
+        )
         dependencies.add("implementation", "tools.jackson.core:jackson-core")
         dependencies.add("implementation", "tools.jackson.core:jackson-databind")
-        dependencies.add("implementation", "org.openapitools:jackson-databind-nullable:0.2.10")
-        dependencies.add("compileOnly", "jakarta.validation:jakarta.validation-api:3.1.1")
-        dependencies.add("compileOnly", "jakarta.annotation:jakarta.annotation-api:3.0.0")
+        dependencies.addProvider(
+            "implementation",
+            extension.jacksonDatabindNullableVersion.map { "org.openapitools:jackson-databind-nullable:$it" },
+        )
+        dependencies.addProvider(
+            "compileOnly",
+            extension.jakartaValidationVersion.map { "jakarta.validation:jakarta.validation-api:$it" },
+        )
+        dependencies.addProvider(
+            "compileOnly",
+            extension.jakartaAnnotationVersion.map { "jakarta.annotation:jakarta.annotation-api:$it" },
+        )
     }
 }
 
@@ -212,22 +335,38 @@ internal object OpenApiClientConfigurationValidator {
         apiPackage: String?,
         modelPackage: String?,
         packageName: String?,
+        generatorName: String? = "java",
+        library: String? = "restclient",
+        sourceFolder: String? = "src/main/java",
+        serializationLibrary: String? = "jackson",
+        dateLibrary: String? = "java8",
+        enumPropertyNaming: String? = "MACRO_CASE",
         apis: List<String>,
+        models: List<String> = emptyList(),
+        supportingFiles: List<String> = emptyList(),
         schemaMappings: Map<String, String>,
         typeMappings: Map<String, String>,
+        inlineSchemaOptions: Map<String, String> = mapOf("RESOLVE_INLINE_ENUMS" to "true"),
+        configOptions: Map<String, String> = emptyMap(),
     ) {
         requireNonBlank("specPath", specPath)
         requireNonBlank("apiPackage", apiPackage)
         requireNonBlank("modelPackage", modelPackage)
         requireNonBlank("packageName", packageName)
+        requireNonBlank("generatorName", generatorName)
+        requireNonBlank("library", library)
+        requireNonBlank("sourceFolder", sourceFolder)
+        requireNonBlank("serializationLibrary", serializationLibrary)
+        requireNonBlank("dateLibrary", dateLibrary)
+        requireNonBlank("enumPropertyNaming", enumPropertyNaming)
 
-        apis.forEach { api ->
-            if (api.isBlank()) {
-                throw GradleException("openApiClient.apis must not contain blank values.")
-            }
-        }
+        validateList("apis", apis)
+        validateList("models", models)
+        validateList("supportingFiles", supportingFiles)
         validateMappings("schemaMappings", schemaMappings)
         validateMappings("typeMappings", typeMappings)
+        validateMappings("inlineSchemaOptions", inlineSchemaOptions)
+        validateMappings("configOptions", configOptions)
 
         val file = specFile ?: throw GradleException("openApiClient.specPath is required.")
         if (!file.exists()) {
@@ -276,6 +415,14 @@ internal object OpenApiClientConfigurationValidator {
         }
     }
 
+    private fun validateList(name: String, values: List<String>) {
+        values.forEach { value ->
+            if (value.isBlank()) {
+                throw GradleException("openApiClient.$name must not contain blank values.")
+            }
+        }
+    }
+
     private fun parseSpec(file: File): JsonNode {
         val mapper = if (file.extension.equals("yaml", ignoreCase = true) ||
             file.extension.equals("yml", ignoreCase = true)
@@ -313,7 +460,7 @@ internal object OpenApiClientConfigurationValidator {
     }
 }
 
-private fun resolveSpecFile(rootProjectDir: File, specPath: String): File {
+internal fun resolveSpecFile(rootProjectDir: File, specPath: String): File {
     val configured = File(specPath)
     return if (configured.isAbsolute) configured else rootProjectDir.resolve(specPath)
 }

@@ -58,17 +58,30 @@ plugins {
 
 ```kotlin
 openApiClient {
-    specPath.set("libs/openapi-specs/brevo.yml")
-    apiPackage.set("net.blueshell.clients.brevo.api")
-    modelPackage.set("net.blueshell.clients.brevo.model")
-    packageName.set("net.blueshell.clients.brevo.invoker")
-    apis.set(listOf("TransactionalEmails", "Contacts"))
+    specPath.set("libs/openapi-specs/vendor.yml")
+    apiPackage.set("com.example.clients.vendor.api")
+    modelPackage.set("com.example.clients.vendor.model")
+    packageName.set("com.example.clients.vendor.invoker")
+    apis.set(listOf("Messages", "Contacts"))
     schemaMappings.set(
         mapOf(
-            "getContactInfo_identifier_parameter" to "java.lang.String",
+            "external_identifier_parameter" to "java.lang.String",
         ),
     )
     typeMappings.set(emptyMap())
+
+    // Optional overrides; defaults match the extracted Java restclient convention.
+    generatorName.set("java")
+    library.set("restclient")
+    sourceFolder.set("src/main/java")
+    serializationLibrary.set("jackson")
+    dateLibrary.set("java8")
+    useJakartaEe.set(true)
+    useBeanValidation.set(true)
+    useJackson3.set(true)
+    useSpringBoot4.set(true)
+    enumPropertyNaming.set("MACRO_CASE")
+    inlineSchemaOptions.set(mapOf("RESOLVE_INLINE_ENUMS" to "true"))
 }
 ```
 
@@ -82,45 +95,97 @@ Required fields:
 Optional fields:
 
 - `apis`: selected OpenAPI tags/API groups. Empty means generate all APIs.
+- `models`: selected generated models. Empty keeps generator default behavior.
+- `supportingFiles`: selected supporting files. Empty keeps generator default behavior.
 - `schemaMappings`: OpenAPI Generator schema mappings.
 - `typeMappings`: OpenAPI Generator type mappings.
+- `configOptions` and `inlineSchemaOptions`: additional OpenAPI Generator options.
 
-The plugin registers `build/generated/openapi/src/main/java` as main Java source and makes Java compilation depend on `generate`. Generated clients use OpenAPI Generator `java` + `restclient`, Jackson 3, Jakarta annotations/validation, and Spring 7 client dependencies.
+The plugin registers `build/generated/openapi/<sourceFolder>` as main Java source and makes Java compilation depend on `generate`. Generated clients use OpenAPI Generator `java` + `restclient`, Jackson 3, Jakarta annotations/validation, and Spring 7 client dependencies by default. Dependency versions are exposed as extension properties for consumers that need a different Spring, Jackson, or Jakarta stack.
 
-## Prepared Specs
+## External Specs
 
-Spec acquisition, refresh, filtering, and vendor-specific normalization stay in the consuming repo. Wire prep tasks to `generate`:
+Spec acquisition, refresh, filtering, and vendor-specific values stay in the consuming repo. The plugin provides opt-in generic helpers for common external-spec lifecycle steps:
 
 ```kotlin
-val filteredSpec = layout.buildDirectory.file("discord-filtered.json")
+openApiExternalSpecs {
+    specDirectory.set(rootProject.layout.projectDirectory.dir("libs/openapi-specs"))
 
-val filterDiscordSpec = tasks.register("filterDiscordSpec") {
-    inputs.file(rootProject.layout.projectDirectory.file("libs/openapi-specs/discord.json"))
-    outputs.file(filteredSpec)
+    specs {
+        create("vendor") {
+            sourceUrl.set(providers.gradleProperty("vendorOpenApiUrl"))
+            rawFileName.set("vendor.raw.json")
+            normalizedFileName.set("vendor.json")
+        }
+    }
 
-    doLast {
-        // Write the reduced local spec to filteredSpec.
+    filters {
+        create("vendorClient") {
+            inputSpec.set("libs/openapi-specs/vendor.json")
+            outputSpec.set("services/api/clients/vendor/build/vendor-filtered.json")
+            allowedOperations.set(
+                mapOf(
+                    "/accounts/{account_id}" to listOf("get"),
+                    "/messages" to listOf("post"),
+                ),
+            )
+            injectedTag.set("Vendor")
+            pruneUnreachableSchemas.set(true)
+            rewriteNullTypes.set(true)
+            collapseRedundantEnumAllOf.set(true)
+        }
     }
 }
 
 tasks.named("generate") {
-    dependsOn(filterDiscordSpec)
+    dependsOn("filterVendorClientOpenApiSpec")
 }
 
 openApiClient {
-    specPath.set("services/api/clients/discord/build/discord-filtered.json")
-    apiPackage.set("net.blueshell.clients.discord.api")
-    modelPackage.set("net.blueshell.clients.discord.model")
-    packageName.set("net.blueshell.clients.discord.invoker")
-    apis.set(listOf("Discord"))
+    specPath.set("services/api/clients/vendor/build/vendor-filtered.json")
+    apiPackage.set("com.example.clients.vendor.api")
+    modelPackage.set("com.example.clients.vendor.model")
+    packageName.set("com.example.clients.vendor.invoker")
+    apis.set(listOf("Vendor"))
 }
 ```
 
-Validation runs after `generate` dependencies, so prepared specs are checked after the prep task writes them.
+`downloadExternalOpenApiSpecs` downloads configured sources to the central directory. `normalizeExternalOpenApiSpecs` converts configured JSON/YAML raw files to deterministic minified JSON. Named filters register tasks named `filter<Name>OpenApiSpec`.
+
+Validation runs after `generate` dependencies, so prepared specs are checked after the prep task writes them. Vendor URLs, operation allow lists, and package names remain consumer-owned configuration.
+
+## Provenance and Drift
+
+The plugin also exposes generic task types for generated text artifacts:
+
+```kotlin
+tasks.register<dev.extratoast.openapi.client.OpenApiProvenanceBannerTask>("bannerGeneratedApi") {
+    inputFile.set(layout.buildDirectory.file("generated/api.tmp.ts"))
+    outputFile.set(layout.projectDirectory.file("src/api/generated.ts"))
+    bannerText.set(
+        """
+        /**
+         * AUTO-GENERATED. Do not edit by hand.
+         * Source: services/api/openapi.json
+         * Regenerate with: pnpm contract:generate
+         * Drift gate: pnpm contract:check
+         */
+        """.trimIndent(),
+    )
+}
+
+tasks.register<dev.extratoast.openapi.client.OpenApiDriftCheckTask>("checkGeneratedApiDrift") {
+    expectedFile.set(layout.projectDirectory.file("src/api/generated.ts"))
+    actualFile.set(layout.buildDirectory.file("generated/api.tmp.ts"))
+    failureMessage.set("Generated API client drift detected. Regenerate the client.")
+}
+```
+
+These helpers do exact text processing only. They do not choose or invoke a frontend TypeScript generator.
 
 ## Boundary
 
-This plugin only reads local OpenAPI documents and generates typed JVM clients. It does not download upstream specs, detect upstream drift, publish generated client libraries, or replace `api-contract-checks`.
+The `generate` task only reads local OpenAPI documents and generates typed JVM clients. External download, normalization, filtering, provenance, and drift tasks are explicit opt-in helpers. The plugin does not hardcode vendor endpoints, publish generated client libraries, force a frontend TypeScript generator, or replace `api-contract-checks`.
 
 ## Publishing
 
