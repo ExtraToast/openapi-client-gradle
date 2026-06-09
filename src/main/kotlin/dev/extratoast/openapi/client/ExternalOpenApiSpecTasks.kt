@@ -66,6 +66,14 @@ abstract class DownloadExternalOpenApiSpecsTask : DefaultTask() {
     @get:Internal
     lateinit var configuredSpecs: NamedDomainObjectContainer<ExternalOpenApiSpec>
 
+    @get:Input
+    val configuredSourceUrls: Map<String, String>
+        get() = configuredSpecs.toList().associate { spec -> spec.name to (spec.sourceUrl.orNull ?: "") }
+
+    @get:Input
+    val configuredRawFileNames: Map<String, String>
+        get() = configuredSpecs.toList().associate { spec -> spec.name to spec.rawFileName.get() }
+
     @TaskAction
     fun download() {
         val specs = configuredSpecs.toList()
@@ -101,6 +109,14 @@ abstract class NormalizeExternalOpenApiSpecsTask : DefaultTask() {
     @get:Internal
     lateinit var configuredSpecs: NamedDomainObjectContainer<ExternalOpenApiSpec>
 
+    @get:Input
+    val configuredRawFileNames: Map<String, String>
+        get() = configuredSpecs.toList().associate { spec -> spec.name to spec.rawFileName.get() }
+
+    @get:Input
+    val configuredNormalizedFileNames: Map<String, String>
+        get() = configuredSpecs.toList().associate { spec -> spec.name to normalizedJsonFileName(spec) }
+
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.RELATIVE)
     val rawSpecFiles: org.gradle.api.file.FileCollection
@@ -114,7 +130,7 @@ abstract class NormalizeExternalOpenApiSpecsTask : DefaultTask() {
     val normalizedSpecFiles: org.gradle.api.file.FileCollection
         get() = project.files(
             configuredSpecs.toList().map { spec ->
-                safeChild(specDirectory.get().asFile, spec.normalizedFileName.get(), "normalizedFileName")
+                safeChild(specDirectory.get().asFile, normalizedJsonFileName(spec), "normalizedFileName")
             },
         )
 
@@ -127,16 +143,10 @@ abstract class NormalizeExternalOpenApiSpecsTask : DefaultTask() {
 
         val outputDir = specDirectory.get().asFile
         specs.forEach { spec ->
+            val normalizedName = normalizedJsonFileName(spec)
             val source = safeChild(outputDir, spec.rawFileName.get(), "rawFileName")
             if (!source.exists() || !source.isFile) {
                 throw GradleException("Raw OpenAPI spec for '${spec.name}' does not exist: ${source.absolutePath}")
-            }
-
-            val normalizedName = spec.normalizedFileName.get()
-            if (!normalizedName.endsWith(".json", ignoreCase = true)) {
-                throw GradleException(
-                    "openApiExternalSpecs.specs.${spec.name}.normalizedFileName must end with .json.",
-                )
             }
 
             val target = safeChild(outputDir, normalizedName, "normalizedFileName")
@@ -244,7 +254,7 @@ abstract class OpenApiFilterSpecTask : DefaultTask() {
                     pathItem.remove(key)
                 } else {
                     val operation = pathItem.path(key) as? ObjectNode
-                    operation?.set<ArrayNode>("tags", operation.arrayNode().add(tag))
+                    operation?.replace("tags", operation.arrayNode().add(tag))
                 }
             }
             if (pathItem.fieldNames().asSequence().none { it.lowercase() in methods }) {
@@ -389,6 +399,16 @@ private fun parseSourceUri(specName: String, source: String): URI {
         throw GradleException("openApiExternalSpecs.specs.$specName.sourceUrl must be an absolute URI: $source")
     }
     return uri
+}
+
+private fun normalizedJsonFileName(spec: ExternalOpenApiSpec): String {
+    val normalizedName = spec.normalizedFileName.get()
+    if (!normalizedName.endsWith(".json", ignoreCase = true)) {
+        throw GradleException(
+            "openApiExternalSpecs.specs.${spec.name}.normalizedFileName must end with .json.",
+        )
+    }
+    return normalizedName
 }
 
 private fun parseComponentRef(ref: String): ComponentRef? {
