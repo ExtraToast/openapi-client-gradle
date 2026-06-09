@@ -42,6 +42,11 @@ class OpenApiClientPlugin : Plugin<Project> {
             "openApiClient",
             OpenApiClientExtension::class.java,
         )
+        val externalSpecs = project.extensions.create(
+            "openApiExternalSpecs",
+            OpenApiExternalSpecsExtension::class.java,
+        )
+        externalSpecs.specDirectory.convention(project.layout.projectDirectory.dir("openapi-specs"))
 
         project.repositories.mavenCentral()
         project.addGeneratedClientDependencies()
@@ -150,6 +155,29 @@ class OpenApiClientPlugin : Plugin<Project> {
             description = "Alias for generate."
             dependsOn(generate)
         })
+
+        project.tasks.register(
+            "downloadExternalOpenApiSpecs",
+            DownloadExternalOpenApiSpecsTask::class.java,
+            Action<DownloadExternalOpenApiSpecsTask> {
+                group = "openapi"
+                description = "Downloads configured external OpenAPI specs to the central spec directory."
+                specDirectory.set(externalSpecs.specDirectory)
+                configuredSpecs = externalSpecs.specs
+            },
+        )
+
+        project.tasks.register(
+            "normalizeExternalOpenApiSpecs",
+            NormalizeExternalOpenApiSpecsTask::class.java,
+            Action<NormalizeExternalOpenApiSpecsTask> {
+                group = "openapi"
+                description = "Normalizes configured external OpenAPI specs to deterministic minified JSON."
+                dependsOn("downloadExternalOpenApiSpecs")
+                specDirectory.set(externalSpecs.specDirectory)
+                configuredSpecs = externalSpecs.specs
+            },
+        )
 
         project.extensions.configure(JavaPluginExtension::class.java, Action<JavaPluginExtension> {
             sourceSets.getByName(SourceSet.MAIN_SOURCE_SET_NAME).java.srcDir(generatedJavaSrc)
@@ -266,11 +294,11 @@ internal object OpenApiClientConfigurationValidator {
 
     private fun collectOperationTags(paths: JsonNode): Set<String> {
         val tags = linkedSetOf<String>()
-        val pathItems = paths.fields()
+        val pathItems = paths.properties().iterator()
         while (pathItems.hasNext()) {
             val pathItem = pathItems.next().value
             if (!pathItem.isObject) continue
-            val operations = pathItem.fields()
+            val operations = pathItem.properties().iterator()
             while (operations.hasNext()) {
                 val operation = operations.next()
                 if (operation.key.lowercase() !in httpMethods || !operation.value.isObject) continue
