@@ -360,9 +360,15 @@ internal object OpenApiSpecJson {
         } else {
             jsonMapper
         }
+        if (file.length() == 0L) {
+            throw GradleException("OpenAPI spec must not be empty: ${file.absolutePath}")
+        }
         return try {
-            mapper.readTree(file)
-                ?: throw GradleException("OpenAPI spec must not be empty: ${file.absolutePath}")
+            val root = mapper.readTree(file)
+            if (root == null || root.isMissingNode) {
+                throw GradleException("OpenAPI spec must not be empty: ${file.absolutePath}")
+            }
+            root
         } catch (exc: JsonProcessingException) {
             throw GradleException("OpenAPI spec must be valid JSON or YAML: ${file.absolutePath}", exc)
         }
