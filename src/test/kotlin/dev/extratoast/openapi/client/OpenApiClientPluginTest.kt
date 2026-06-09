@@ -368,6 +368,258 @@ class OpenApiClientPluginTest {
     }
 
     @Test
+    fun `filter task rejects invalid configuration and malformed specs`() {
+        val validSpec = writeSpec("specs/filter-valid.json", minimalFilterFixture())
+
+        assertFilterFails(
+            expectedMessage = "allowedOperations must contain at least one path",
+            inputSpec = validSpec,
+            allowedOperations = emptyMap(),
+        )
+        assertFilterFails(
+            expectedMessage = "injectedTag is required and must not be blank",
+            inputSpec = validSpec,
+            allowedOperations = mapOf("/pets" to listOf("get")),
+            injectedTag = " ",
+        )
+        assertFilterFails(
+            expectedMessage = "OpenAPI spec must be a JSON/YAML object",
+            inputSpec = writeSpec("specs/filter-array.json", "[]"),
+            allowedOperations = mapOf("/pets" to listOf("get")),
+        )
+        assertFilterFails(
+            expectedMessage = "OpenAPI spec must contain a 'paths' object",
+            inputSpec = writeSpec(
+                "specs/filter-no-paths.json",
+                """{"openapi":"3.0.3","info":{"title":"No paths","version":"1.0.0"}}""",
+            ),
+            allowedOperations = mapOf("/pets" to listOf("get")),
+        )
+        assertFilterFails(
+            expectedMessage = "OpenApiFilterSpecTask outputSpec must end with .json",
+            inputSpec = validSpec,
+            outputRelativePath = "build/filtered/not-json.txt",
+            allowedOperations = mapOf("/pets" to listOf("get")),
+        )
+        assertFilterFails(
+            expectedMessage = "allowedOperations references path(s) not present",
+            inputSpec = validSpec,
+            allowedOperations = mapOf("/missing" to listOf("get")),
+        )
+        assertFilterFails(
+            expectedMessage = "allowedOperations[/pets] must contain at least one HTTP method",
+            inputSpec = validSpec,
+            allowedOperations = mapOf("/pets" to emptyList()),
+        )
+        assertFilterFails(
+            expectedMessage = "allowedOperations[/pets] contains unsupported HTTP method(s): connect",
+            inputSpec = validSpec,
+            allowedOperations = mapOf("/pets" to listOf("CONNECT")),
+        )
+    }
+
+    @Test
+    fun `filter task can leave schema transforms disabled and removes paths with no remaining methods`() {
+        val input = writeSpec("specs/filter-toggles.json", transformToggleFixture())
+        val output = tempDir.resolve("build/filtered/toggles.json")
+
+        val task = registerFilterTask(
+            inputSpec = input,
+            outputRelativePath = "build/filtered/toggles.json",
+            allowedOperations = mapOf(
+                "/kept" to listOf("GET"),
+                "/method-missing" to listOf("post"),
+            ),
+        ) {
+            pruneUnreachableSchemas.set(false)
+            rewriteNullTypes.set(false)
+            collapseRedundantEnumAllOf.set(false)
+        }
+
+        task.filter()
+
+        val root = jsonMapper.readTree(output.toFile())
+        val paths = root.path("paths")
+        assertTrue(paths.has("/kept"))
+        assertFalse(paths.path("/kept").has("delete"))
+        assertEquals("Fixture", paths.path("/kept").path("get").path("tags")[0].asText())
+        assertFalse(paths.has("/method-missing"))
+        assertFalse(paths.has("/dropped"))
+
+        val schemas = root.path("components").path("schemas")
+        assertTrue(schemas.has("UnusedFromDropped"))
+        assertEquals("null", schemas.path("NullableMarker").path("type").asText())
+        assertTrue(schemas.path("EnumWrapper").has("allOf"))
+        assertTrue(schemas.path("EnumWrapper").has("enum"))
+    }
+
+    @Test
+    fun `filter task prunes schemas reached through escaped json pointers`() {
+        val input = writeSpec("specs/filter-escaped-pointers.json", escapedPointerFixture())
+        val output = tempDir.resolve("build/filtered/escaped-pointers.json")
+
+        val task = registerFilterTask(
+            inputSpec = input,
+            outputRelativePath = "build/filtered/escaped-pointers.json",
+            allowedOperations = mapOf("/escaped" to listOf("get")),
+        )
+
+        task.filter()
+
+        val schemas = jsonMapper.readTree(output.toFile()).path("components").path("schemas")
+        assertTrue(schemas.has("Escaped/Name~Thing"))
+        assertTrue(schemas.has("Nested/Child"))
+        assertTrue(schemas.has("ArrayLeaf"))
+        assertFalse(schemas.has("Unused/Schema"))
+    }
+
+    @Test
+    fun `external spec tasks validate empty specs uris missing raws and safe paths directly`() {
+        val source = writeSpec(
+            "fixtures/external-valid.json",
+            """{"openapi":"3.0.3","info":{"title":"Valid","version":"1.0.0"},"paths":{}}""",
+        )
+        val sourceUri = source.toUri().toString()
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("configured") {
+                sourceUrl.set(sourceUri)
+                rawFileName.set("nested/raw.yml")
+                normalizedFileName.set("nested/out.JSON")
+            }
+
+            assertEquals(mapOf("configured" to sourceUri), harness.download.configuredSourceUrls)
+            assertEquals(mapOf("configured" to "nested/raw.yml"), harness.download.configuredRawFileNames)
+            assertEquals(mapOf("configured" to "nested/raw.yml"), harness.normalize.configuredRawFileNames)
+            assertEquals(mapOf("configured" to "nested/out.JSON"), harness.normalize.configuredNormalizedFileNames)
+            assertTrue(harness.normalize.rawSpecFiles.files.single().toPath().endsWith("openapi-specs/nested/raw.yml"))
+            assertTrue(
+                harness.normalize.normalizedSpecFiles.files.single().toPath()
+                    .endsWith("openapi-specs/nested/out.JSON"),
+            )
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("success") {
+                sourceUrl.set(sourceUri)
+                rawFileName.set("downloads/source.raw")
+                normalizedFileName.set("downloads/source.json")
+            }
+
+            harness.download.download()
+            assertEquals(source.readText(), tempDir.resolve("openapi-specs/downloads/source.raw").readText())
+
+            harness.normalize.normalize()
+            assertEquals(
+                """{"info":{"title":"Valid","version":"1.0.0"},"openapi":"3.0.3","paths":{}}""",
+                tempDir.resolve("openapi-specs/downloads/source.json").readText(),
+            )
+        }
+
+        externalSpecHarness().let { harness ->
+            assertGradleFails("openApiExternalSpecs.specs must contain at least one configured spec") {
+                harness.download.download()
+            }
+            assertGradleFails("openApiExternalSpecs.specs must contain at least one configured spec") {
+                harness.normalize.normalize()
+            }
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("badUri") {
+                sourceUrl.set("fixtures/external-valid.json")
+            }
+            assertGradleFails("sourceUrl must be an absolute URI") {
+                harness.download.download()
+            }
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("malformedUri") {
+                sourceUrl.set("http://[invalid")
+            }
+            assertGradleFails("sourceUrl must be a valid URI") {
+                harness.download.download()
+            }
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("blankRaw") {
+                sourceUrl.set(sourceUri)
+                rawFileName.set(" ")
+            }
+            assertGradleFails("rawFileName must not be blank") {
+                harness.download.download()
+            }
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("absoluteRaw") {
+                sourceUrl.set(sourceUri)
+                rawFileName.set(tempDir.resolve("outside.raw").toString())
+            }
+            assertGradleFails("rawFileName must be relative") {
+                harness.download.download()
+            }
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("traversalRaw") {
+                sourceUrl.set(sourceUri)
+                rawFileName.set("../outside.raw")
+            }
+            assertGradleFails("rawFileName must stay inside") {
+                harness.download.download()
+            }
+        }
+
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("missingRaw") {
+                rawFileName.set("missing.yml")
+                normalizedFileName.set("missing.json")
+            }
+            assertGradleFails("Raw OpenAPI spec for 'missingRaw' does not exist") {
+                harness.normalize.normalize()
+            }
+        }
+
+        writeSpec("openapi-specs/raw.json", source.readText())
+        externalSpecHarness().let { harness ->
+            harness.extension.specs.create("traversalNormalized") {
+                rawFileName.set("raw.json")
+                normalizedFileName.set("../outside.json")
+            }
+            assertGradleFails("normalizedFileName must stay inside") {
+                harness.normalize.normalize()
+            }
+        }
+    }
+
+    @Test
+    fun `openapi spec json rejects empty files and sorts nested objects in arrays`() {
+        val empty = writeSpec("specs/empty-openapi-json.json", "")
+        assertGradleFails("OpenAPI spec must not be empty") {
+            OpenApiSpecJson.read(empty.toFile())
+        }
+
+        val source = writeSpec(
+            "specs/unsorted.json",
+            """
+            {
+              "z": [{"b": 2, "a": 1}],
+              "a": {"d": 4, "c": 3}
+            }
+            """.trimIndent(),
+        )
+        val target = tempDir.resolve("build/normalized/sorted.json")
+        target.parent.createDirectories()
+
+        OpenApiSpecJson.writeMinified(OpenApiSpecJson.read(source.toFile()), target.toFile())
+
+        assertEquals("""{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}""", target.readText())
+    }
+
+    @Test
     fun `applies plugin conventions to a Gradle project`() {
         writeBuildFile("")
         writeResource("specs/sample.yml", tempDir.resolve("specs/sample.yml"))
@@ -609,6 +861,87 @@ class OpenApiClientPluginTest {
         return target
     }
 
+    private fun registerFilterTask(
+        inputSpec: Path,
+        outputRelativePath: String,
+        allowedOperations: Map<String, List<String>>,
+        injectedTag: String = "Fixture",
+        configure: OpenApiFilterSpecTask.() -> Unit = {},
+    ): OpenApiFilterSpecTask {
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+
+        return project.tasks.register("filterSpec", OpenApiFilterSpecTask::class.java) {
+            this.inputSpec.set(project.layout.projectDirectory.file(inputSpec.relativeToTempDir()))
+            outputSpec.set(project.layout.projectDirectory.file(outputRelativePath))
+            this.allowedOperations.set(allowedOperations)
+            this.injectedTag.set(injectedTag)
+            configure()
+        }.get()
+    }
+
+    private fun assertFilterFails(
+        expectedMessage: String,
+        inputSpec: Path,
+        allowedOperations: Map<String, List<String>>,
+        injectedTag: String = "Fixture",
+        outputRelativePath: String = "build/filtered/failing.json",
+    ) {
+        val task = registerFilterTask(
+            inputSpec = inputSpec,
+            outputRelativePath = outputRelativePath,
+            allowedOperations = allowedOperations,
+            injectedTag = injectedTag,
+        )
+        assertGradleFails(expectedMessage) {
+            task.filter()
+        }
+    }
+
+    private fun assertGradleFails(expectedMessage: String, action: () -> Unit) {
+        val error = assertThrows(GradleException::class.java) {
+            action()
+        }
+        assertTrue(
+            error.message?.contains(expectedMessage) == true,
+            "Expected '${error.message}' to contain '$expectedMessage'",
+        )
+    }
+
+    private fun externalSpecHarness(): ExternalSpecHarness {
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+        val extension = project.objects.newInstance(OpenApiExternalSpecsExtension::class.java)
+        extension.specDirectory.set(project.layout.projectDirectory.dir("openapi-specs"))
+        val download = project.tasks.register(
+            "downloadExternalOpenApiSpecs",
+            DownloadExternalOpenApiSpecsTask::class.java,
+        ) {
+            specDirectory.set(extension.specDirectory)
+            configuredSpecs = extension.specs
+        }.get()
+        val normalize = project.tasks.register(
+            "normalizeExternalOpenApiSpecs",
+            NormalizeExternalOpenApiSpecsTask::class.java,
+        ) {
+            specDirectory.set(extension.specDirectory)
+            configuredSpecs = extension.specs
+        }.get()
+
+        return ExternalSpecHarness(extension, download, normalize)
+    }
+
+    private data class ExternalSpecHarness(
+        val extension: OpenApiExternalSpecsExtension,
+        val download: DownloadExternalOpenApiSpecsTask,
+        val normalize: NormalizeExternalOpenApiSpecsTask,
+    )
+
+    private fun Path.relativeToTempDir(): String =
+        tempDir.relativize(this).toString().replace("\\", "/")
+
     private fun validateConfiguration(
         specFile: Path?,
         specPath: String? = specFile?.toString() ?: "spec.yml",
@@ -675,6 +1008,132 @@ class OpenApiClientPluginTest {
               responses:
                 '204':
                   description: No content.
+        """.trimIndent()
+
+    private fun minimalFilterFixture(): String =
+        """
+        {
+          "openapi": "3.0.3",
+          "info": {"title": "Filter Valid", "version": "1.0.0"},
+          "paths": {
+            "/pets": {
+              "get": {
+                "responses": {"204": {"description": "No content"}}
+              }
+            }
+          }
+        }
+        """.trimIndent()
+
+    private fun transformToggleFixture(): String =
+        """
+        {
+          "openapi": "3.1.0",
+          "info": {"title": "Transform Toggles", "version": "1.0.0"},
+          "paths": {
+            "/kept": {
+              "get": {
+                "responses": {
+                  "200": {
+                    "description": "ok",
+                    "content": {
+                      "application/json": {
+                        "schema": {"${'$'}ref": "#/components/schemas/Kept"}
+                      }
+                    }
+                  }
+                }
+              },
+              "delete": {
+                "responses": {"204": {"description": "deleted"}}
+              }
+            },
+            "/method-missing": {
+              "get": {
+                "responses": {"204": {"description": "No content"}}
+              }
+            },
+            "/dropped": {
+              "get": {
+                "responses": {
+                  "200": {
+                    "description": "unused",
+                    "content": {
+                      "application/json": {
+                        "schema": {"${'$'}ref": "#/components/schemas/UnusedFromDropped"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "components": {
+            "schemas": {
+              "Kept": {
+                "type": "object",
+                "properties": {
+                  "nullable": {"${'$'}ref": "#/components/schemas/NullableMarker"},
+                  "enumWrapper": {"${'$'}ref": "#/components/schemas/EnumWrapper"}
+                }
+              },
+              "NullableMarker": {"type": "null"},
+              "EnumWrapper": {
+                "allOf": [{"${'$'}ref": "#/components/schemas/EnumValue"}],
+                "enum": ["one"]
+              },
+              "EnumValue": {"type": "string", "enum": ["one", "two"]},
+              "UnusedFromDropped": {"type": "object"}
+            }
+          }
+        }
+        """.trimIndent()
+
+    private fun escapedPointerFixture(): String =
+        """
+        {
+          "openapi": "3.1.0",
+          "info": {"title": "Escaped Pointers", "version": "1.0.0"},
+          "paths": {
+            "/escaped": {
+              "get": {
+                "responses": {
+                  "200": {
+                    "description": "ok",
+                    "content": {
+                      "application/json": {
+                        "schema": {"${'$'}ref": "#/components/schemas/Escaped~1Name~0Thing"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "components": {
+            "schemas": {
+              "Escaped/Name~Thing": {
+                "type": "object",
+                "properties": {
+                  "child": {"${'$'}ref": "#/components/schemas/Nested~1Child"}
+                }
+              },
+              "Nested/Child": {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": [
+                      {"${'$'}ref": "#/components/schemas/ArrayLeaf"}
+                    ]
+                  }
+                }
+              },
+              "ArrayLeaf": {"type": "string"},
+              "Unused/Schema": {"type": "object"}
+            }
+          }
+        }
         """.trimIndent()
 
     private fun discordLikeFixture(): String =
