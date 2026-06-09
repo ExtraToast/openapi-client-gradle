@@ -294,11 +294,11 @@ internal object OpenApiClientConfigurationValidator {
 
     private fun collectOperationTags(paths: JsonNode): Set<String> {
         val tags = linkedSetOf<String>()
-        val pathItems = paths.fields()
+        val pathItems = paths.properties().iterator()
         while (pathItems.hasNext()) {
             val pathItem = pathItems.next().value
             if (!pathItem.isObject) continue
-            val operations = pathItem.fields()
+            val operations = pathItem.properties().iterator()
             while (operations.hasNext()) {
                 val operation = operations.next()
                 if (operation.key.lowercase() !in httpMethods || !operation.value.isObject) continue

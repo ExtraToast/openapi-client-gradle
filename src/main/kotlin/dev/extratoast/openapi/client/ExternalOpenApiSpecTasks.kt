@@ -14,14 +14,18 @@ import org.gradle.api.NamedDomainObjectContainer
 import org.gradle.api.model.ObjectFactory
 import org.gradle.api.provider.MapProperty
 import org.gradle.api.provider.Property
+import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.InputFiles
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.OutputFile
+import org.gradle.api.tasks.OutputFiles
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
+import org.gradle.work.DisableCachingByDefault
 import java.io.File
 import java.net.URI
 import javax.inject.Inject
@@ -54,6 +58,7 @@ abstract class ExternalOpenApiSpec @Inject constructor(
     val normalizedFileName: Property<String> = objects.property(String::class.java)
 }
 
+@DisableCachingByDefault(because = "Downloads from remote URLs; output not reproducible from inputs")
 abstract class DownloadExternalOpenApiSpecsTask : DefaultTask() {
     @get:OutputDirectory
     abstract val specDirectory: org.gradle.api.file.DirectoryProperty
@@ -88,12 +93,30 @@ abstract class DownloadExternalOpenApiSpecsTask : DefaultTask() {
     }
 }
 
+@CacheableTask
 abstract class NormalizeExternalOpenApiSpecsTask : DefaultTask() {
-    @get:OutputDirectory
+    @get:Internal
     abstract val specDirectory: org.gradle.api.file.DirectoryProperty
 
     @get:Internal
     lateinit var configuredSpecs: NamedDomainObjectContainer<ExternalOpenApiSpec>
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    val rawSpecFiles: org.gradle.api.file.FileCollection
+        get() = project.files(
+            configuredSpecs.toList().map { spec ->
+                safeChild(specDirectory.get().asFile, spec.rawFileName.get(), "rawFileName")
+            },
+        )
+
+    @get:OutputFiles
+    val normalizedSpecFiles: org.gradle.api.file.FileCollection
+        get() = project.files(
+            configuredSpecs.toList().map { spec ->
+                safeChild(specDirectory.get().asFile, spec.normalizedFileName.get(), "normalizedFileName")
+            },
+        )
 
     @TaskAction
     fun normalize() {
@@ -124,6 +147,7 @@ abstract class NormalizeExternalOpenApiSpecsTask : DefaultTask() {
     }
 }
 
+@CacheableTask
 abstract class OpenApiFilterSpecTask : DefaultTask() {
     @get:InputFile
     @get:PathSensitive(PathSensitivity.RELATIVE)
@@ -279,7 +303,7 @@ abstract class OpenApiFilterSpecTask : DefaultTask() {
                 }
                 return
             }
-            node.fields().forEachRemaining { collectRefs(it.value, schemaRefs, componentRefs) }
+            node.properties().forEach { collectRefs(it.value, schemaRefs, componentRefs) }
         } else if (node.isArray) {
             node.forEach { collectRefs(it, schemaRefs, componentRefs) }
         }
@@ -290,7 +314,7 @@ abstract class OpenApiFilterSpecTask : DefaultTask() {
             if (node.path("type").asText(null) == "null") {
                 node.put("type", "boolean")
             }
-            node.fields().forEachRemaining { rewriteNullTypeProperties(it.value) }
+            node.properties().forEach { rewriteNullTypeProperties(it.value) }
         } else if (node.isArray) {
             node.forEach { rewriteNullTypeProperties(it) }
         }
@@ -305,7 +329,7 @@ abstract class OpenApiFilterSpecTask : DefaultTask() {
                 node.put("\$ref", ref)
                 return
             }
-            node.fields().forEachRemaining { collapseRedundantEnumAllOf(it.value) }
+            node.properties().forEach { collapseRedundantEnumAllOf(it.value) }
         } else if (node.isArray) {
             node.forEach { collapseRedundantEnumAllOf(it) }
         }
