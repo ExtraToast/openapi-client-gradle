@@ -340,14 +340,14 @@ internal object OpenApiSpecJson {
 
     private fun sortObjects(node: JsonNode): JsonNode {
         if (node is ObjectNode) {
-            val sorted = ObjectNode(node.nodeFactory)
+            val sorted = node.objectNode()
             node.fieldNames().asSequence().toList().sorted().forEach { field ->
                 sorted.set<JsonNode>(field, sortObjects(node.get(field)))
             }
             return sorted
         }
         if (node is ArrayNode) {
-            val sorted = ArrayNode(node.nodeFactory)
+            val sorted = node.arrayNode()
             node.forEach { sorted.add(sortObjects(it)) }
             return sorted
         }
