@@ -474,6 +474,97 @@ class OpenApiClientPluginTest {
     }
 
     @Test
+    fun `named external spec filters are registered from the DSL`() {
+        writeSettings()
+        writeSpec("specs/discord-like.json", discordLikeFixture())
+        writeBuildFile(
+            """
+            plugins {
+                id("dev.extratoast.openapi-client")
+            }
+
+            openApiExternalSpecs {
+                filters {
+                    create("discordLike") {
+                        inputSpec.set("specs/discord-like.json")
+                        outputSpec.set("build/filtered/from-dsl.json")
+                        allowedOperations.set(
+                            mapOf(
+                                "/users/@me" to listOf("get"),
+                                "/guilds/{guild_id}" to listOf("get"),
+                                "/guilds/{guild_id}/members/{user_id}" to listOf("get", "patch"),
+                            )
+                        )
+                        injectedTag.set("Fixture")
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val result = runGradle("filterDiscordLikeOpenApiSpec")
+
+        assertEquals(TaskOutcome.SUCCESS, result.task(":filterDiscordLikeOpenApiSpec")?.outcome)
+        val root = jsonMapper.readTree(tempDir.resolve("build/filtered/from-dsl.json").toFile())
+        assertTrue(root.path("paths").has("/users/@me"))
+        assertFalse(root.path("paths").has("/unused"))
+        assertEquals("Fixture", root.path("paths").path("/users/@me").path("get").path("tags")[0].asText())
+        assertFalse(root.path("components").path("schemas").has("UnusedSchema"))
+    }
+
+    @Test
+    fun `provenance banner task writes a generic banner without duplicating it`() {
+        val input = writeSpec("generated/raw.ts", "export type Pet = { id: string }\n")
+        val output = tempDir.resolve("generated/with-banner.ts")
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+        val task = project.tasks.register("banner", OpenApiProvenanceBannerTask::class.java) {
+            inputFile.set(project.layout.projectDirectory.file(input.relativeToTempDir()))
+            outputFile.set(project.layout.projectDirectory.file(output.relativeToTempDir()))
+            bannerText.set(
+                """
+                /**
+                 * AUTO-GENERATED.
+                 * Source: api/openapi.json
+                 * Regenerate with: ./gradlew generate
+                 */
+                """.trimIndent(),
+            )
+        }.get()
+
+        task.applyBanner()
+        task.inputFile.set(project.layout.projectDirectory.file(output.relativeToTempDir()))
+        task.applyBanner()
+
+        val text = output.readText()
+        assertTrue(text.startsWith("/**\n * AUTO-GENERATED."))
+        assertEquals(1, Regex("AUTO-GENERATED").findAll(text).count())
+        assertTrue(text.contains("export type Pet"))
+    }
+
+    @Test
+    fun `drift check task compares generated artifacts exactly`() {
+        val expected = writeSpec("generated/expected.ts", "same\n")
+        val actual = writeSpec("generated/actual.ts", "same\n")
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+        val task = project.tasks.register("drift", OpenApiDriftCheckTask::class.java) {
+            expectedFile.set(project.layout.projectDirectory.file(expected.relativeToTempDir()))
+            actualFile.set(project.layout.projectDirectory.file(actual.relativeToTempDir()))
+            failureMessage.set("contract drift")
+        }.get()
+
+        task.checkDrift()
+
+        actual.writeText("different\n")
+        assertGradleFails("contract drift") {
+            task.checkDrift()
+        }
+    }
+
+    @Test
     fun `external spec tasks validate empty specs uris missing raws and safe paths directly`() {
         val source = writeSpec(
             "fixtures/external-valid.json",
@@ -637,6 +728,16 @@ class OpenApiClientPluginTest {
         extension.apis.set(listOf("Pets"))
         extension.schemaMappings.set(mapOf("UnusedInlineSchema" to "java.lang.Object"))
         extension.typeMappings.set(mapOf("unused-format" to "java.lang.String"))
+        extension.generatorName.set("java")
+        extension.library.set("restclient")
+        extension.sourceFolder.set("src/main/java")
+        extension.serializationLibrary.set("jackson")
+        extension.dateLibrary.set("java8")
+        extension.useJakartaEe.set(true)
+        extension.useBeanValidation.set(true)
+        extension.useJackson3.set(true)
+        extension.useSpringBoot4.set(true)
+        extension.enumPropertyNaming.set("MACRO_CASE")
 
         val generate = project.tasks.named("generate", GenerateTask::class.java).get()
         assertEquals("openapi", generate.group)
@@ -690,6 +791,68 @@ class OpenApiClientPluginTest {
         val implementation = project.configurations.getByName("implementation").dependencies
         assertTrue(implementation.any { it.group == "org.springframework" && it.name == "spring-web" })
         assertTrue(implementation.any { it.group == "tools.jackson" && it.name == "jackson-bom" })
+    }
+
+    @Test
+    fun `allows Java generator convention options to be overridden`() {
+        writeBuildFile("")
+        writeResource("specs/sample.yml", tempDir.resolve("specs/sample.yml"))
+        val project = ProjectBuilder.builder()
+            .withProjectDir(tempDir.toFile())
+            .build()
+
+        OpenApiClientPlugin().apply(project)
+        val extension = project.extensions.getByType(OpenApiClientExtension::class.java)
+        extension.specPath.set("specs/sample.yml")
+        extension.apiPackage.set("com.example.pet.api")
+        extension.modelPackage.set("com.example.pet.model")
+        extension.packageName.set("com.example.pet.invoker")
+        extension.generatorName.set("java")
+        extension.library.set("webclient")
+        extension.sourceFolder.set("generated/java")
+        extension.serializationLibrary.set("gson")
+        extension.dateLibrary.set("legacy")
+        extension.useJakartaEe.set(false)
+        extension.useBeanValidation.set(false)
+        extension.useJackson3.set(false)
+        extension.useSpringBoot4.set(false)
+        extension.enumPropertyNaming.set("original")
+        extension.generateModelTests.set(true)
+        extension.generateApiTests.set(true)
+        extension.generateApiDocumentation.set(false)
+        extension.generateModelDocumentation.set(false)
+        extension.apis.set(listOf("Pets"))
+        extension.models.set(listOf("Pet"))
+        extension.supportingFiles.set(listOf("ApiClient.java"))
+        extension.inlineSchemaOptions.set(mapOf("RESOLVE_INLINE_ENUMS" to "false"))
+        extension.configOptions.set(mapOf("hideGenerationTimestamp" to "true"))
+
+        val generate = project.tasks.named("generate", GenerateTask::class.java).get()
+
+        assertEquals("webclient", generate.library.get())
+        assertEquals(true, generate.generateModelTests.get())
+        assertEquals(true, generate.generateApiTests.get())
+        assertEquals(false, generate.generateApiDocumentation.get())
+        assertEquals(false, generate.generateModelDocumentation.get())
+        assertEquals(
+            mapOf("apis" to "Pets", "models" to "Pet", "supportingFiles" to "ApiClient.java"),
+            generate.globalProperties.get(),
+        )
+        assertEquals(mapOf("RESOLVE_INLINE_ENUMS" to "false"), generate.inlineSchemaOptions.get())
+        assertEquals(
+            mapOf(
+                "sourceFolder" to "generated/java",
+                "serializationLibrary" to "gson",
+                "dateLibrary" to "legacy",
+                "useJakartaEe" to "false",
+                "useBeanValidation" to "false",
+                "useJackson3" to "false",
+                "useSpringBoot4" to "false",
+                "enumPropertyNaming" to "original",
+                "hideGenerationTimestamp" to "true",
+            ),
+            generate.configOptions.get(),
+        )
     }
 
     @Test

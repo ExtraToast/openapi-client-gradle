@@ -28,12 +28,15 @@ import org.gradle.api.tasks.TaskAction
 import org.gradle.work.DisableCachingByDefault
 import java.io.File
 import java.net.URI
+import java.util.Locale
 import javax.inject.Inject
 
 abstract class OpenApiExternalSpecsExtension @Inject constructor(objects: ObjectFactory) {
     val specDirectory = objects.directoryProperty()
     val specs: NamedDomainObjectContainer<ExternalOpenApiSpec> =
         objects.domainObjectContainer(ExternalOpenApiSpec::class.java)
+    val filters: NamedDomainObjectContainer<ExternalOpenApiSpecFilter> =
+        objects.domainObjectContainer(ExternalOpenApiSpecFilter::class.java)
 
     init {
         specs.all {
@@ -44,6 +47,10 @@ abstract class OpenApiExternalSpecsExtension @Inject constructor(objects: Object
 
     fun specs(action: Action<NamedDomainObjectContainer<ExternalOpenApiSpec>>) {
         action.execute(specs)
+    }
+
+    fun filters(action: Action<NamedDomainObjectContainer<ExternalOpenApiSpecFilter>>) {
+        action.execute(filters)
     }
 }
 
@@ -56,6 +63,23 @@ abstract class ExternalOpenApiSpec @Inject constructor(
     val sourceUrl: Property<String> = objects.property(String::class.java)
     val rawFileName: Property<String> = objects.property(String::class.java)
     val normalizedFileName: Property<String> = objects.property(String::class.java)
+}
+
+abstract class ExternalOpenApiSpecFilter @Inject constructor(
+    private val filterName: String,
+    objects: ObjectFactory,
+) : Named {
+    override fun getName(): String = filterName
+
+    val inputSpec: Property<String> = objects.property(String::class.java)
+    val outputSpec: Property<String> = objects.property(String::class.java)
+    val allowedOperations: MapProperty<String, List<String>> =
+        objects.mapProperty(String::class.java, listOfStringsType())
+    val injectedTag: Property<String> = objects.property(String::class.java)
+    val pruneUnreachableSchemas: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val rewriteNullTypes: Property<Boolean> = objects.property(Boolean::class.javaObjectType).convention(true)
+    val collapseRedundantEnumAllOf: Property<Boolean> =
+        objects.property(Boolean::class.javaObjectType).convention(true)
 }
 
 @DisableCachingByDefault(because = "Downloads from remote URLs; output not reproducible from inputs")
@@ -346,7 +370,73 @@ abstract class OpenApiFilterSpecTask : DefaultTask() {
     }
 }
 
+@CacheableTask
+abstract class OpenApiProvenanceBannerTask : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val inputFile: org.gradle.api.file.RegularFileProperty
+
+    @get:OutputFile
+    abstract val outputFile: org.gradle.api.file.RegularFileProperty
+
+    @get:Input
+    abstract val bannerText: Property<String>
+
+    @TaskAction
+    fun applyBanner() {
+        val banner = bannerText.orNull?.takeIf { it.isNotBlank() }
+            ?: throw GradleException("bannerText is required and must not be blank.")
+        val normalizedBanner = if (banner.endsWith("\n")) banner else "$banner\n"
+        val input = inputFile.get().asFile
+        if (!input.exists() || !input.isFile) {
+            throw GradleException("inputFile does not exist: ${input.absolutePath}")
+        }
+        val output = outputFile.get().asFile
+        output.parentFile.mkdirs()
+        val existing = input.readText()
+        output.writeText(if (existing.startsWith(normalizedBanner)) existing else normalizedBanner + existing)
+    }
+}
+
+@DisableCachingByDefault(because = "Verification task compares generated files and has no outputs")
+abstract class OpenApiDriftCheckTask : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val expectedFile: org.gradle.api.file.RegularFileProperty
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val actualFile: org.gradle.api.file.RegularFileProperty
+
+    @get:Input
+    abstract val failureMessage: Property<String>
+
+    init {
+        failureMessage.convention("Generated OpenAPI artifact drift detected.")
+    }
+
+    @TaskAction
+    fun checkDrift() {
+        val expected = expectedFile.get().asFile
+        val actual = actualFile.get().asFile
+        if (!expected.exists() || !expected.isFile) {
+            throw GradleException("expectedFile does not exist: ${expected.absolutePath}")
+        }
+        if (!actual.exists() || !actual.isFile) {
+            throw GradleException("actualFile does not exist: ${actual.absolutePath}")
+        }
+        if (expected.readText() != actual.readText()) {
+            throw GradleException(failureMessage.get())
+        }
+    }
+}
+
 private data class ComponentRef(val section: String, val name: String)
+
+internal fun filterOpenApiSpecTaskName(name: String): String =
+    "filter${name.replaceFirstChar { first ->
+        if (first.isLowerCase()) first.titlecase(Locale.ROOT) else first.toString()
+    }}OpenApiSpec"
 
 internal object OpenApiSpecJson {
     private val jsonMapper = ObjectMapper()
@@ -442,3 +532,6 @@ private fun safeChild(directory: File, relativePath: String, propertyName: Strin
     }
     return target
 }
+
+@Suppress("UNCHECKED_CAST")
+private fun listOfStringsType(): Class<List<String>> = List::class.java as Class<List<String>>
